@@ -9,6 +9,11 @@
 
 #include "common/assert.h"
 
+#ifdef ENABLE_OPENGL
+#include "util/opengl_loader.h"
+#endif
+
+
 GPU_HW_ShaderGen::GPU_HW_ShaderGen(RenderAPI render_api, bool supports_dual_source_blend,
                                    bool supports_framebuffer_fetch)
   : ShaderGen(render_api, GetShaderLanguageForAPI(render_api), supports_dual_source_blend, supports_framebuffer_fetch)
@@ -2188,28 +2193,29 @@ std::string GPU_HW_ShaderGen::GenerateBatchFragmentShader(GPU_HW::BatchRenderMod
   WriteColorConversionFunctions(ss);
   WriteBatchUniformBuffer(ss);
 
-  std::vector<std::string> inputs = {"float4 a_pos", "float4 a_col0"};
-  std::vector<std::pair<std::string, std::string>> outputs;
-  if (textured)
+  DeclareTexture(ss, "samp0", 0);
+
+  if (use_rov)
   {
-    inputs.push_back("uint a_texcoord");
-    inputs.push_back("uint a_texpage");
-    if (uv_limits)
-    {
-      inputs.push_back("float4 a_uv_limits");
-      outputs.push_back({"nointerpolation", "float4 v_uv_limits"});
-    }
-    if (!page_texture)
-    {
-      outputs.push_back({"nointerpolation", palette ? "uint4 v_texpage" : "uint2 v_texpage"});
-    }
+    DeclareImage(ss, "rov_color", 0);
+    if (use_rov_depth)
+      DeclareImage(ss, "rov_depth", 1, true);
   }
-  if (gte_lighting)
+
+  if (m_glsl)
+    ss << "CONSTANT int[16] s_dither_values = int[16]( ";
+  else
+    ss << "CONSTANT int s_dither_values[] = {";
+  for (u32 i = 0; i < 16; i++)
   {
-    inputs.push_back("float3 a_normal");
-    outputs.push_back({"", "float3 v_normal"});
+    if (i > 0)
+      ss << ", ";
+    ss << DITHER_MATRIX[i / 4][i % 4];
   }
-  DeclareVertexEntryPoint(ss, inputs, 1, textured ? 1 : 0, outputs, false, "", msaa, per_sample_shading, disable_color_perspective);
+  if (m_glsl)
+    ss << " );\n";
+  else
+    ss << "};\n";
 
   ss << R"(
 uint3 ApplyDithering(uint2 coord, uint3 icol)
@@ -3418,3 +3424,357 @@ std::string GPU_HW_ShaderGen::GenerateReplacementMergeFragmentShader(bool replac
 
   return std::move(ss).str();
 }
+
+void GPU_HW_ShaderGen::DeclareVertexEntryPoint(
+  std::stringstream& ss, const std::vector<std::string>& attributes, u32 num_color_outputs,
+  u32 num_texcoord_outputs, const std::vector<std::pair<std::string, std::string>>& additional_outputs,
+  bool declare_vertex_id, const char* output_block_suffix, bool msaa,
+  bool ssaa, bool noperspective_color) const
+{
+  if (m_glsl)
+  {
+    if (m_use_glsl_binding_layout)
+    {
+      u32 attribute_counter = 0;
+      for (const auto& attribute : attributes)
+      {
+        ss << "layout(location = " << attribute_counter << ") in " << attribute << ";\n";
+        attribute_counter++;
+      }
+    }
+    else
+    {
+      for (const auto& attribute : attributes)
+        ss << "in " << attribute << ";\n";
+    }
+
+    if (m_use_glsl_interface_blocks)
+    {
+      const char* qualifier = GetInterpolationQualifier(true, msaa, ssaa, true);
+
+      if (m_spirv)
+        ss << "layout(location = 0) ";
+
+      ss << "out VertexData" << output_block_suffix << " {\n";
+      for (u32 i = 0; i < num_color_outputs; i++)
+        ss << "  " << (noperspective_color ? "noperspective " : "") << qualifier << "float4 v_col" << i << ";\n";
+
+      for (u32 i = 0; i < num_texcoord_outputs; i++)
+        ss << "  " << qualifier << "float2 v_tex" << i << ";\n";
+
+      for (const auto& [qualifiers, name] : additional_outputs)
+      {
+        const char* qualifier_to_use = (!qualifiers.empty()) ? qualifiers.c_str() : qualifier;
+        ss << "  " << qualifier_to_use << " " << name << ";\n";
+      }
+      ss << "};\n";
+    }
+    else
+    {
+      const char* qualifier = GetInterpolationQualifier(false, msaa, ssaa, true);
+
+      u32 location = 0;
+      for (u32 i = 0; i < num_color_outputs; i++)
+      {
+        if (m_spirv)
+          ss << "layout(location = " << location++ << ") ";
+
+        ss << qualifier << (noperspective_color ? "noperspective " : "") << "out float4 v_col" << i << ";\n";
+      }
+
+      for (u32 i = 0; i < num_texcoord_outputs; i++)
+      {
+        if (m_spirv)
+          ss << "layout(location = " << location++ << ") ";
+
+        ss << qualifier << "out float2 v_tex" << i << ";\n";
+      }
+
+      for (const auto& [qualifiers, name] : additional_outputs)
+      {
+        if (m_spirv)
+          ss << "layout(location = " << location++ << ") ";
+
+        const char* qualifier_to_use = (!qualifiers.empty()) ? qualifiers.c_str() : qualifier;
+        ss << qualifier_to_use << " out " << name << ";\n";
+      }
+    }
+
+    ss << "#define v_pos gl_Position\n\n";
+    if (declare_vertex_id)
+    {
+      if (m_spirv)
+        ss << "#define v_id uint(gl_VertexIndex)\n";
+      else
+        ss << "#define v_id uint(gl_VertexID)\n";
+    }
+
+    ss << "\n";
+    ss << "void main()\n";
+  }
+  else
+  {
+    const char* qualifier = GetInterpolationQualifier(false, msaa, ssaa, true);
+
+    ss << "void main(\n";
+
+    if (declare_vertex_id)
+      ss << "  in uint v_id : SV_VertexID,\n";
+
+    u32 attribute_counter = 0;
+    for (const auto& attribute : attributes)
+    {
+      ss << "  in " << attribute << " : ATTR" << attribute_counter << ",\n";
+      attribute_counter++;
+    }
+
+    for (u32 i = 0; i < num_color_outputs; i++)
+      ss << "  " << qualifier << (noperspective_color ? "noperspective " : "") << "out float4 v_col" << i << " : COLOR"
+         << i << ",\n";
+
+    for (u32 i = 0; i < num_texcoord_outputs; i++)
+      ss << "  " << qualifier << "out float2 v_tex" << i << " : TEXCOORD" << i << ",\n";
+
+    u32 additional_counter = num_texcoord_outputs;
+    for (const auto& [qualifiers, name] : additional_outputs)
+    {
+      const char* qualifier_to_use = (!qualifiers.empty()) ? qualifiers.c_str() : qualifier;
+      ss << "  " << qualifier_to_use << " out " << name << " : TEXCOORD" << additional_counter << ",\n";
+      additional_counter++;
+    }
+
+    ss << "  out float4 v_pos : SV_Position)\n";
+  }
+}
+
+void GPU_HW_ShaderGen::DeclareFragmentEntryPoint(
+  std::stringstream& ss, u32 num_color_inputs, u32 num_texcoord_inputs,
+  const std::vector<std::pair<std::string, std::string>>& additional_inputs,
+  bool declare_fragcoord, u32 num_color_outputs, bool dual_source_output,
+  bool depth_output, bool msaa, bool ssaa,
+  bool declare_sample_id, bool noperspective_color,
+  bool feedback_loop, bool rov) const
+{
+  if (m_glsl)
+  {
+    if (num_color_inputs > 0 || num_texcoord_inputs > 0 || additional_inputs.size() > 0)
+    {
+      if (m_use_glsl_interface_blocks)
+      {
+        const char* qualifier = GetInterpolationQualifier(true, msaa, ssaa, false);
+
+        if (m_spirv)
+          ss << "layout(location = 0) ";
+
+        ss << "in VertexData {\n";
+        for (u32 i = 0; i < num_color_inputs; i++)
+          ss << "  " << qualifier << (noperspective_color ? "noperspective " : "") << "float4 v_col" << i << ";\n";
+
+        for (u32 i = 0; i < num_texcoord_inputs; i++)
+          ss << "  " << qualifier << "float2 v_tex" << i << ";\n";
+
+        for (const auto& [qualifiers, name] : additional_inputs)
+        {
+          const char* qualifier_to_use = (!qualifiers.empty()) ? qualifiers.c_str() : qualifier;
+          ss << "  " << qualifier_to_use << " " << name << ";\n";
+        }
+        ss << "};\n";
+      }
+      else
+      {
+        const char* qualifier = GetInterpolationQualifier(false, msaa, ssaa, false);
+
+        u32 location = 0;
+        for (u32 i = 0; i < num_color_inputs; i++)
+        {
+          if (m_spirv)
+            ss << "layout(location = " << location++ << ") ";
+
+          ss << qualifier << (noperspective_color ? "noperspective " : "") << "in float4 v_col" << i << ";\n";
+        }
+
+        for (u32 i = 0; i < num_texcoord_inputs; i++)
+        {
+          if (m_spirv)
+            ss << "layout(location = " << location++ << ") ";
+
+          ss << qualifier << "in float2 v_tex" << i << ";\n";
+        }
+
+        for (const auto& [qualifiers, name] : additional_inputs)
+        {
+          if (m_spirv)
+            ss << "layout(location = " << location++ << ") ";
+
+          const char* qualifier_to_use = (!qualifiers.empty()) ? qualifiers.c_str() : qualifier;
+          ss << qualifier_to_use << " in " << name << ";\n";
+        }
+      }
+    }
+
+    if (declare_fragcoord)
+      ss << "#define v_pos gl_FragCoord\n";
+
+    if (declare_sample_id)
+      ss << "#define f_sample_index uint(gl_SampleID)\n";
+
+    if (depth_output)
+      ss << "#define o_depth gl_FragDepth\n";
+
+    const char* target_0_qualifier = "out";
+
+    if (feedback_loop)
+    {
+      Assert(!rov);
+
+#ifdef ENABLE_OPENGL
+      if (m_render_api == RenderAPI::OpenGL || m_render_api == RenderAPI::OpenGLES)
+      {
+        Assert(m_supports_framebuffer_fetch);
+        if (GLAD_GL_EXT_shader_framebuffer_fetch)
+        {
+          target_0_qualifier = "inout";
+          ss << "#define LAST_FRAG_COLOR o_col0\n";
+        }
+        else if (GLAD_GL_ARM_shader_framebuffer_fetch)
+        {
+          ss << "#define LAST_FRAG_COLOR gl_LastFragColorARM\n";
+        }
+      }
+#endif
+#ifdef ENABLE_VULKAN
+      if (m_render_api == RenderAPI::Vulkan)
+      {
+        ss << "layout(input_attachment_index = 0, set = 2, binding = 0) uniform "
+           << (msaa ? "subpassInputMS" : "subpassInput") << " u_input_rt; \n";
+        ss << "#define LAST_FRAG_COLOR " << (msaa ? "subpassLoad(u_input_rt, gl_SampleID)" : "subpassLoad(u_input_rt)")
+           << "\n";
+      }
+#endif
+#ifdef __APPLE__
+      if (m_render_api == RenderAPI::Metal)
+      {
+        if (m_supports_framebuffer_fetch)
+        {
+          // Set doesn't matter, because it's transformed to color0.
+          ss << "layout(input_attachment_index = 0, set = 2, binding = 0) uniform "
+             << (msaa ? "subpassInputMS" : "subpassInput") << " u_input_rt; \n";
+          ss << "#define LAST_FRAG_COLOR "
+             << (msaa ? "subpassLoad(u_input_rt, gl_SampleID)" : "subpassLoad(u_input_rt)") << "\n";
+        }
+        else
+        {
+          ss << "layout(set = 2, binding = 0) uniform " << (msaa ? "texture2DMS" : "texture2D") << " u_input_rt;\n";
+          ss << "#define LAST_FRAG_COLOR texelFetch(u_input_rt, int2(gl_FragCoord.xy), " << (msaa ? "gl_SampleID" : "0")
+             << ")\n";
+        }
+      }
+#endif
+    }
+
+    if (rov)
+    {
+      Assert(!feedback_loop);
+      Assert(!depth_output);
+      Assert(num_color_outputs == 0);
+    }
+    else
+    {
+      if (m_spirv)
+      {
+        for (u32 i = 0; i < num_color_outputs; i++)
+        {
+          if (dual_source_output)
+            ss << "layout(location = 0, index = " << i << ") " << target_0_qualifier << " float4 o_col" << i << ";\n";
+          else
+            ss << "layout(location = " << i << ") " << target_0_qualifier << " float4 o_col" << i << ";\n";
+        }
+      }
+      else
+      {
+        for (u32 i = 0; i < num_color_outputs; i++)
+        {
+          if (dual_source_output)
+          {
+            // not supported on ES anyway, standard desktop GL layout qualifier will be handled in compiler
+            ss << target_0_qualifier << " float4 o_col" << i << ";\n";
+          }
+          else
+          {
+            ss << target_0_qualifier << " float4 o_col" << i << ";\n";
+          }
+        }
+      }
+    }
+
+    ss << "\nvoid main()\n";
+  }
+  else
+  {
+    const char* qualifier = GetInterpolationQualifier(false, msaa, ssaa, false);
+
+    ss << "void main(\n";
+
+    bool first = true;
+    for (u32 i = 0; i < num_color_inputs; i++)
+    {
+      ss << (first ? "" : ",\n") << "  " << qualifier << (noperspective_color ? "noperspective " : "")
+         << "in float4 v_col" << i << " : COLOR" << i;
+      first = false;
+    }
+
+    for (u32 i = 0; i < num_texcoord_inputs; i++)
+    {
+      ss << (first ? "" : ",\n") << "  " << qualifier << "in float2 v_tex" << i << " : TEXCOORD" << i;
+      first = false;
+    }
+
+    u32 additional_counter = num_texcoord_inputs;
+    for (const auto& [qualifiers, name] : additional_inputs)
+    {
+      const char* qualifier_to_use = (!qualifiers.empty()) ? qualifiers.c_str() : qualifier;
+      ss << (first ? "" : ",\n") << "  " << qualifier_to_use << " in " << name << " : TEXCOORD" << additional_counter;
+      additional_counter++;
+      first = false;
+    }
+
+    if (declare_fragcoord)
+    {
+      ss << (first ? "" : ",\n") << "  in float4 v_pos : SV_Position";
+      first = false;
+    }
+    if (declare_sample_id)
+    {
+      ss << (first ? "" : ",\n") << "  in uint f_sample_index : SV_SampleIndex";
+      first = false;
+    }
+
+    if (depth_output)
+    {
+      ss << (first ? "" : ",\n") << "  out float o_depth : SV_Depth";
+      first = false;
+    }
+
+    if (feedback_loop)
+    {
+      // Pixel shader reads output color... not supported on HLSL.
+      // But we still declare the output color anyway.
+      Assert(num_color_outputs == 1);
+      ss << (first ? "" : ",\n") << "  inout float4 o_col0 : SV_Target0";
+      ss << "\n#define LAST_FRAG_COLOR o_col0\n";
+    }
+    else
+    {
+      for (u32 i = 0; i < num_color_outputs; i++)
+      {
+        if (dual_source_output)
+          ss << (first ? "" : ",\n") << "  out float4 o_col" << i << " : SV_Target" << i; // SV_Target0 / 1
+        else
+          ss << (first ? "" : ",\n") << "  out float4 o_col" << i << " : SV_Target" << i;
+        first = false;
+      }
+    }
+
+    ss << ")\n";
+  }
+}

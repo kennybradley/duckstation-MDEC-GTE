@@ -6,6 +6,9 @@
 #include "gpu_hw.h"
 
 #include "util/shadergen.h"
+#include <vector>
+#include <string>
+
 
 class GPU_HW_ShaderGen : public ShaderGen
 {
@@ -55,4 +58,17 @@ private:
   void WriteBatchUniformBuffer(std::stringstream& ss) const;
   void WriteBatchTextureFilter(std::stringstream& ss, GPUTextureFilter texture_filter) const;
   void WriteAdaptiveDownsampleUniformBuffer(std::stringstream& ss) const;
+
+  void DeclareVertexEntryPoint(std::stringstream& ss, const std::vector<std::string>& attributes,
+                               u32 num_color_outputs, u32 num_texcoord_outputs,
+                               const std::vector<std::pair<std::string, std::string>>& additional_outputs,
+                               bool declare_vertex_id = false, const char* output_block_suffix = "", bool msaa = false,
+                               bool ssaa = false, bool noperspective_color = false) const;
+
+  void DeclareFragmentEntryPoint(std::stringstream& ss, u32 num_color_inputs, u32 num_texcoord_inputs,
+                                 const std::vector<std::pair<std::string, std::string>>& additional_inputs = {},
+                                 bool declare_fragcoord = false, u32 num_color_outputs = 1, bool dual_source_output = false,
+                                 bool depth_output = false, bool msaa = false, bool ssaa = false,
+                                 bool declare_sample_id = false, bool noperspective_color = false,
+                                 bool feedback_loop = false, bool rov = false) const;
 };
