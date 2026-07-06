@@ -13,6 +13,7 @@
 #include "gpu_sw_rasterizer.h"
 #include "host.h"
 #include "interrupt_controller.h"
+#include "mdec.h"
 #include "performance_counters.h"
 #include "settings.h"
 #include "system.h"
@@ -383,6 +384,10 @@ struct Locals
   u32 vram_to_cpu_dump_id = 0;
 
   InlineFIFOQueue<u64, MAX_FIFO_SIZE> fifo;
+
+  MDECVideoRegion mdec_region = {};
+  bool mdec_upscale_enabled = true;
+  bool gte_lighting_enabled = true;
 };
 } // namespace
 
@@ -525,6 +530,7 @@ void GPU::SoftReset()
   if (s_locals.blitter_state == BlitterState::WritingVRAM)
     FinishVRAMWrite();
 
+  s_locals.mdec_region = {};
   s_locals.GPUSTAT.texture_page_x_base = 0;
   s_locals.GPUSTAT.texture_page_y_base = 0;
   s_locals.GPUSTAT.semi_transparency_mode = GPUTransparencyMode::HalfBackgroundPlusHalfForeground;
@@ -3141,6 +3147,40 @@ bool GPU::HandleRenderPolygonCommand()
                                     s_locals.drawing_offset.x, s_locals.drawing_offset.y, &vert->x, &vert->y, &vert->w);
     }
 
+    if (valid_w && num_vertices >= 3 && s_locals.gte_lighting_enabled)
+    {
+      float z0 = (cmd->vertices[0].w > 0.0001f) ? (1.0f / cmd->vertices[0].w) : 1.0f;
+      float z1 = (cmd->vertices[1].w > 0.0001f) ? (1.0f / cmd->vertices[1].w) : 1.0f;
+      float z2 = (cmd->vertices[2].w > 0.0001f) ? (1.0f / cmd->vertices[2].w) : 1.0f;
+
+      float ux = cmd->vertices[1].x - cmd->vertices[0].x;
+      float uy = cmd->vertices[1].y - cmd->vertices[0].y;
+      float uz = z1 - z0;
+
+      float vx = cmd->vertices[2].x - cmd->vertices[0].x;
+      float vy = cmd->vertices[2].y - cmd->vertices[0].y;
+      float vz = z2 - z0;
+
+      float nx = uy * vz - uz * vy;
+      float ny = uz * vx - ux * vz;
+      float nz = ux * vy - uy * vx;
+
+      float len = std::sqrt(nx * nx + ny * ny + nz * nz);
+      if (len > 0.0001f)
+      {
+        nx /= len; ny /= len; nz /= len;
+      }
+      else
+      {
+        nx = 0.0f; ny = 0.0f; nz = 1.0f;
+      }
+
+      for (u32 i = 0; i < num_vertices; i++)
+      {
+        // Extended structures go here if added in GPUBackend definitions
+      }
+    }
+
     cmd->valid_w = valid_w;
     if (!valid_w)
     {
@@ -3728,6 +3768,20 @@ bool GPU::HandleCopyRectangleCPUToVRAMCommand()
   const u32 copy_width = ReplaceZero(size & VRAM_WIDTH_MASK, 0x400);
   const u32 copy_height = ReplaceZero((size >> 16) & VRAM_HEIGHT_MASK, 0x200);
   const u32 num_pixels = copy_width * copy_height;
+
+  if (MDEC::IsActive())
+  {
+    s_locals.mdec_region.x = Truncate16(dst_x);
+    s_locals.mdec_region.y = Truncate16(dst_y);
+    s_locals.mdec_region.width = Truncate16(copy_width);
+    s_locals.mdec_region.height = Truncate16(copy_height);
+    s_locals.mdec_region.active = true;
+  }
+  else if (dst_x + copy_width > s_locals.mdec_region.x && dst_x < s_locals.mdec_region.x + s_locals.mdec_region.width &&
+           dst_y + copy_height > s_locals.mdec_region.y && dst_y < s_locals.mdec_region.y + s_locals.mdec_region.height)
+  {
+    s_locals.mdec_region.active = false;
+  }
   const u32 num_words = ((num_pixels + 1) / 2);
 
   DEBUG_LOG("Copy rectangle from CPU to VRAM offset=({},{}), size=({},{})", dst_x, dst_y, copy_width, copy_height);
@@ -4151,4 +4205,29 @@ void GPU::ProcessGPUDumpPacket(GPUDump::PacketType type, const std::span<const u
     default:
       break;
   }
+}
+
+GPU::MDECVideoRegion GPU::GetActiveMDECVideoRegion()
+{
+  return s_locals.mdec_region;
+}
+
+void GPU::SetMDECUpscaleEnabled(bool enabled)
+{
+  s_locals.mdec_upscale_enabled = enabled;
+}
+
+bool GPU::IsMDECUpscaleEnabled()
+{
+  return s_locals.mdec_upscale_enabled;
+}
+
+void GPU::SetGTELightingEnabled(bool enabled)
+{
+  s_locals.gte_lighting_enabled = enabled;
+}
+
+bool GPU::IsGTELightingEnabled()
+{
+  return s_locals.gte_lighting_enabled;
 }

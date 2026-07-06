@@ -47,7 +47,11 @@ void GPU_HW_ShaderGen::WriteBatchUniformBuffer(std::stringstream& ss) const
                        {"uint2 u_texture_window_and", "uint2 u_texture_window_or", "float u_src_alpha_factor",
                         "float u_dst_alpha_factor", "uint u_interlaced_displayed_field",
                         "bool u_set_mask_while_drawing", "float u_resolution_scale", "float u_rcp_resolution_scale",
-                        "float u_resolution_scale_minus_one"},
+                        "float u_resolution_scale_minus_one",
+                        "uint4 u_mdec_region",
+                        "bool u_mdec_upscale_active",
+                        "bool u_gte_lighting_active",
+                        "float3 u_light_dir"},
                        false);
 }
 
@@ -72,10 +76,7 @@ std::string GPU_HW_ShaderGen::GenerateScreenVertexShader() const
   return std::move(ss).str();
 }
 
-std::string GPU_HW_ShaderGen::GenerateBatchVertexShader(bool upscaled, bool msaa, bool per_sample_shading,
-                                                        bool textured, bool palette, bool page_texture, bool uv_limits,
-                                                        bool force_round_texcoords, bool pgxp_depth,
-                                                        bool disable_color_perspective) const
+std::string GPU_HW_ShaderGen::GenerateBatchVertexShader(bool upscaled, bool msaa, bool per_sample_shading, bool textured, bool palette, bool page_texture, bool uv_limits, bool force_round_texcoords, bool pgxp_depth, bool disable_color_perspective, bool gte_lighting) const
 {
   std::stringstream ss;
   WriteHeader(ss);
@@ -89,42 +90,28 @@ std::string GPU_HW_ShaderGen::GenerateBatchVertexShader(bool upscaled, bool msaa
 
   WriteBatchUniformBuffer(ss);
 
-  if (textured && page_texture)
+  std::vector<std::string> inputs = {"float4 a_pos", "float4 a_col0"};
+  std::vector<std::pair<std::string, std::string>> outputs;
+  if (textured)
   {
+    inputs.push_back("uint a_texcoord");
+    inputs.push_back("uint a_texpage");
     if (uv_limits)
     {
-      DeclareVertexEntryPoint(
-        ss, {"float4 a_pos", "float4 a_col0", "uint a_texcoord", "uint a_texpage", "float4 a_uv_limits"}, 1, 1,
-        {{"nointerpolation", "float4 v_uv_limits"}}, false, "", msaa, per_sample_shading, disable_color_perspective);
+      inputs.push_back("float4 a_uv_limits");
+      outputs.push_back({"nointerpolation", "float4 v_uv_limits"});
     }
-    else
+    if (!page_texture)
     {
-      DeclareVertexEntryPoint(ss, {"float4 a_pos", "float4 a_col0", "uint a_texcoord", "uint a_texpage"}, 1, 1, {},
-                              false, "", msaa, per_sample_shading, disable_color_perspective);
+      outputs.push_back({"nointerpolation", palette ? "uint4 v_texpage" : "uint2 v_texpage"});
     }
   }
-  else if (textured)
+  if (gte_lighting)
   {
-    if (uv_limits)
-    {
-      DeclareVertexEntryPoint(
-        ss, {"float4 a_pos", "float4 a_col0", "uint a_texcoord", "uint a_texpage", "float4 a_uv_limits"}, 1, 1,
-        {{"nointerpolation", palette ? "uint4 v_texpage" : "uint2 v_texpage"},
-         {"nointerpolation", "float4 v_uv_limits"}},
-        false, "", msaa, per_sample_shading, disable_color_perspective);
-    }
-    else
-    {
-      DeclareVertexEntryPoint(ss, {"float4 a_pos", "float4 a_col0", "uint a_texcoord", "uint a_texpage"}, 1, 1,
-                              {{"nointerpolation", palette ? "uint4 v_texpage" : "uint2 v_texpage"}}, false, "", msaa,
-                              per_sample_shading, disable_color_perspective);
-    }
+    inputs.push_back("float3 a_normal");
+    outputs.push_back({"", "float3 v_normal"});
   }
-  else
-  {
-    DeclareVertexEntryPoint(ss, {"float4 a_pos", "float4 a_col0"}, 1, 0, {}, false, "", msaa, per_sample_shading,
-                            disable_color_perspective);
-  }
+  DeclareVertexEntryPoint(ss, inputs, 1, textured ? 1 : 0, outputs, false, "", msaa, per_sample_shading, disable_color_perspective);
 
   ss << R"(
 {
@@ -159,6 +146,9 @@ std::string GPU_HW_ShaderGen::GenerateBatchVertexShader(bool upscaled, bool msaa
   v_pos = float4(pos_x * pos_w, pos_y * pos_w, pos_z * pos_w, pos_w);
 
   v_col0 = a_col0;
+  #if GTE_LIGHTING
+    v_normal = a_normal;
+  #endif
   #if TEXTURED
     v_tex0 = float2(uint2(a_texcoord & 0xFFFFu, a_texcoord >> 16));
     #if !PALETTE && !PAGE_TEXTURE
@@ -2142,13 +2132,7 @@ void FilteredSampleFromVRAM(TEXPAGE_VALUE texpage, float2 coords, float4 uv_limi
   }
 }
 
-std::string GPU_HW_ShaderGen::GenerateBatchFragmentShader(
-  GPU_HW::BatchRenderMode render_mode, GPUTransparencyMode transparency, GPU_HW::BatchTextureMode texture_mode,
-  GPUTextureFilter texture_filtering, bool is_blended_texture_filtering, bool upscaled, bool msaa,
-  bool per_sample_shading, bool uv_limits, bool force_round_texcoords, bool modulation_crop, bool true_color,
-  bool dithering, bool scaled_dithering, bool disable_color_perspective, bool interlacing, bool scaled_interlacing,
-  bool check_mask, bool write_mask_as_depth, bool use_rov, bool use_rov_depth, bool rov_depth_test,
-  bool rov_depth_write) const
+std::string GPU_HW_ShaderGen::GenerateBatchFragmentShader(GPU_HW::BatchRenderMode render_mode, GPUTransparencyMode transparency, GPU_HW::BatchTextureMode texture_mode, GPUTextureFilter texture_filtering, bool is_blended_texture_filtering, bool upscaled, bool msaa, bool per_sample_shading, bool uv_limits, bool force_round_texcoords, bool modulation_crop, bool true_color, bool dithering, bool scaled_dithering, bool disable_color_perspective, bool interlacing, bool scaled_interlacing, bool check_mask, bool write_mask_as_depth, bool use_rov, bool use_rov_depth, bool rov_depth_test, bool rov_depth_write, bool gte_lighting) const
 {
   DebugAssert(!true_color || !dithering); // Should not be doing dithering+true color.
 
@@ -2195,6 +2179,7 @@ std::string GPU_HW_ShaderGen::GenerateBatchFragmentShader(
   DefineMacro(ss, "WRITE_MASK_AS_DEPTH", write_mask_as_depth);
   DefineMacro(ss, "FORCE_ROUND_TEXCOORDS", force_round_texcoords);
   DefineMacro(ss, "UPSCALED", upscaled);
+  DefineMacro(ss, "GTE_LIGHTING", gte_lighting);
 
   // Used for converting to normalized coordinates for sampling.
   ss << "CONSTANT float2 RCP_VRAM_SIZE = float2(1.0 / float(" << VRAM_WIDTH << "), 1.0 / float(" << VRAM_HEIGHT
@@ -2202,29 +2187,29 @@ std::string GPU_HW_ShaderGen::GenerateBatchFragmentShader(
 
   WriteColorConversionFunctions(ss);
   WriteBatchUniformBuffer(ss);
-  DeclareTexture(ss, "samp0", 0);
 
-  if (use_rov)
+  std::vector<std::string> inputs = {"float4 a_pos", "float4 a_col0"};
+  std::vector<std::pair<std::string, std::string>> outputs;
+  if (textured)
   {
-    DeclareImage(ss, "rov_color", 0);
-    if (use_rov_depth)
-      DeclareImage(ss, "rov_depth", 1, true);
+    inputs.push_back("uint a_texcoord");
+    inputs.push_back("uint a_texpage");
+    if (uv_limits)
+    {
+      inputs.push_back("float4 a_uv_limits");
+      outputs.push_back({"nointerpolation", "float4 v_uv_limits"});
+    }
+    if (!page_texture)
+    {
+      outputs.push_back({"nointerpolation", palette ? "uint4 v_texpage" : "uint2 v_texpage"});
+    }
   }
-
-  if (m_glsl)
-    ss << "CONSTANT int[16] s_dither_values = int[16]( ";
-  else
-    ss << "CONSTANT int s_dither_values[] = {";
-  for (u32 i = 0; i < 16; i++)
+  if (gte_lighting)
   {
-    if (i > 0)
-      ss << ", ";
-    ss << DITHER_MATRIX[i / 4][i % 4];
+    inputs.push_back("float3 a_normal");
+    outputs.push_back({"", "float3 v_normal"});
   }
-  if (m_glsl)
-    ss << " );\n";
-  else
-    ss << "};\n";
+  DeclareVertexEntryPoint(ss, inputs, 1, textured ? 1 : 0, outputs, false, "", msaa, per_sample_shading, disable_color_perspective);
 
   ss << R"(
 uint3 ApplyDithering(uint2 coord, uint3 icol)
@@ -2240,6 +2225,31 @@ uint3 ApplyDithering(uint2 coord, uint3 icol)
 
 #if TEXTURED
 CONSTANT float4 TRANSPARENT_PIXEL_COLOR = float4(0.0, 0.0, 0.0, 0.0);
+
+float4 BicubicMDECUpscale(float2 uv)
+{
+  float2 texSize = float2(1024.0, 512.0);
+  float2 texelSize = 1.0 / texSize;
+  float2 f = frac(uv * texSize - 0.5);
+  float2 f2 = f * f;
+  float2 f3 = f2 * f;
+  float2 w0_2d = -0.5 * f3 + f2 - 0.5 * f;
+  float2 w1_2d = 1.5 * f3 - 2.5 * f2 + 1.0;
+  float2 w2_2d = -1.5 * f3 + 2.0 * f2 + 0.5 * f;
+  float2 w3_2d = 0.5 * f3 - 0.5 * f2;
+  float4 result = float4(0.0, 0.0, 0.0, 0.0);
+  for (int y = -1; y <= 2; y++)
+  {
+    float wy = (y == -1) ? w0_2d.y : ((y == 0) ? w1_2d.y : ((y == 1) ? w2_2d.y : w3_2d.y));
+    for (int x = -1; x <= 2; x++)
+    {
+      float wx = (x == -1) ? w0_2d.x : ((x == 0) ? w1_2d.x : ((x == 1) ? w2_2d.x : w3_2d.x));
+      float2 offset = float2(float(x), float(y)) * texelSize;
+      result += SAMPLE_TEXTURE(samp0, uv + offset) * (wx * wy);
+    }
+  }
+  return result;
+}
 
 #if PALETTE
   #define TEXPAGE_VALUE uint4
@@ -2370,51 +2380,25 @@ float4 SampleFromVRAM(TEXPAGE_VALUE texpage, DECLARE_UV_LIMITS(float2 coords, fl
 )";
 
   const u32 num_fragment_outputs = use_rov ? 0 : (use_dual_source ? 2 : 1);
-  if (textured && page_texture)
+  std::vector<std::pair<std::string, std::string>> inputs;
+  if (textured)
   {
     if (texture_filtering != GPUTextureFilter::Nearest)
       WriteBatchTextureFilter(ss, texture_filtering);
-
+    if (palette)
+      inputs.push_back({"nointerpolation", "uint4 v_texpage"});
+    else if (!page_texture)
+      inputs.push_back({"nointerpolation", "uint2 v_texpage"});
     if (uv_limits)
-    {
-      DeclareFragmentEntryPoint(ss, 1, 1, {{"nointerpolation", "float4 v_uv_limits"}}, true, num_fragment_outputs,
-                                use_dual_source, write_mask_as_depth, msaa, per_sample_shading, false,
-                                disable_color_perspective, shader_blending && !use_rov, use_rov);
-    }
-    else
-    {
-      DeclareFragmentEntryPoint(ss, 1, 1, {}, true, num_fragment_outputs, use_dual_source, write_mask_as_depth, msaa,
-                                per_sample_shading, false, disable_color_perspective, shader_blending && !use_rov,
-                                use_rov);
-    }
+      inputs.push_back({"nointerpolation", "float4 v_uv_limits"});
   }
-  else if (textured)
+  if (gte_lighting)
   {
-    if (texture_filtering != GPUTextureFilter::Nearest)
-      WriteBatchTextureFilter(ss, texture_filtering);
-
-    if (uv_limits)
-    {
-      DeclareFragmentEntryPoint(ss, 1, 1,
-                                {{"nointerpolation", palette ? "uint4 v_texpage" : "uint2 v_texpage"},
-                                 {"nointerpolation", "float4 v_uv_limits"}},
-                                true, num_fragment_outputs, use_dual_source, write_mask_as_depth, msaa,
-                                per_sample_shading, false, disable_color_perspective, shader_blending && !use_rov,
-                                use_rov);
-    }
-    else
-    {
-      DeclareFragmentEntryPoint(ss, 1, 1, {{"nointerpolation", palette ? "uint4 v_texpage" : "uint2 v_texpage"}}, true,
-                                num_fragment_outputs, use_dual_source, write_mask_as_depth, msaa, per_sample_shading,
-                                false, disable_color_perspective, shader_blending && !use_rov, use_rov);
-    }
+    inputs.push_back({"", "float3 v_normal"});
   }
-  else
-  {
-    DeclareFragmentEntryPoint(ss, 1, 0, {}, true, num_fragment_outputs, use_dual_source, write_mask_as_depth, msaa,
-                              per_sample_shading, false, disable_color_perspective, shader_blending && !use_rov,
-                              use_rov);
-  }
+  DeclareFragmentEntryPoint(ss, 1, textured ? 1 : 0, inputs, true, num_fragment_outputs, use_dual_source,
+                            write_mask_as_depth, msaa, per_sample_shading, false, disable_color_perspective,
+                            shader_blending && !use_rov, use_rov);
 
   ss << R"(
 {
@@ -2438,27 +2422,44 @@ float4 SampleFromVRAM(TEXPAGE_VALUE texpage, DECLARE_UV_LIMITS(float2 coords, fl
 
   #if TEXTURED
     float4 texcol;
-    #if PAGE_TEXTURE && !TEXTURE_FILTERING
-      texcol = SampleFromPageTexture(DECLARE_UV_LIMITS(v_tex0, v_uv_limits));
-      if (VECTOR_EQ(texcol, TRANSPARENT_PIXEL_COLOR))
-        discard;
-
-      ialpha = 1.0;
-    #elif TEXTURE_FILTERING
-      #if PAGE_TEXTURE
-        FilteredSampleFromVRAM(VECTOR_BROADCAST(TEXPAGE_VALUE, 0u), v_tex0, v_uv_limits, texcol, ialpha);
-      #else
-        FilteredSampleFromVRAM(v_texpage, v_tex0, v_uv_limits, texcol, ialpha);
-      #endif
-      if (ialpha < 0.5)
-        discard;
-    #else
-      texcol = SampleFromVRAM(v_texpage, DECLARE_UV_LIMITS(v_tex0, v_uv_limits));
-      if (VECTOR_EQ(texcol, TRANSPARENT_PIXEL_COLOR))
-        discard;
-
-      ialpha = 1.0;
+    bool is_video_texture = false;
+    #if !PAGE_TEXTURE
+      uint2 vram_pos = uint2(v_texpage.xy) + uint2(v_tex0);
+      if (u_mdec_upscale_active && 
+          vram_pos.x >= u_mdec_region.x && vram_pos.y >= u_mdec_region.y &&
+          vram_pos.x <= u_mdec_region.z && vram_pos.y <= u_mdec_region.w)
+      {
+        is_video_texture = true;
+      }
     #endif
+    if (is_video_texture)
+    {
+      float2 norm_uv = float2(vram_pos) * RCP_VRAM_SIZE;
+      texcol = BicubicMDECUpscale(norm_uv);
+      ialpha = 1.0;
+    }
+    else
+    {
+      #if PAGE_TEXTURE && !TEXTURE_FILTERING
+        texcol = SampleFromPageTexture(DECLARE_UV_LIMITS(v_tex0, v_uv_limits));
+        if (VECTOR_EQ(texcol, TRANSPARENT_PIXEL_COLOR))
+          discard;
+        ialpha = 1.0;
+      #elif TEXTURE_FILTERING
+        #if PAGE_TEXTURE
+          FilteredSampleFromVRAM(VECTOR_BROADCAST(TEXPAGE_VALUE, 0u), v_tex0, v_uv_limits, texcol, ialpha);
+        #else
+          FilteredSampleFromVRAM(v_texpage, v_tex0, v_uv_limits, texcol, ialpha);
+        #endif
+        if (ialpha < 0.5)
+          discard;
+      #else
+        texcol = SampleFromVRAM(v_texpage, DECLARE_UV_LIMITS(v_tex0, v_uv_limits));
+        if (VECTOR_EQ(texcol, TRANSPARENT_PIXEL_COLOR)) 
+          discard;
+        ialpha = 1.0;
+      #endif
+    }
 
     semitransparent = (texcol.a >= 0.5);
 
@@ -2503,6 +2504,16 @@ float4 SampleFromVRAM(TEXPAGE_VALUE texpage, DECLARE_UV_LIMITS(float2 coords, fl
 
     // However, the mask bit is cleared if set mask bit is false.
     oalpha = float(u_set_mask_while_drawing);
+  #endif
+
+  #if GTE_LIGHTING
+    if (u_gte_lighting_active)
+    {
+      float3 norm = normalize(v_normal);
+      float diffuse = max(dot(norm, normalize(u_light_dir)), 0.0);
+      icolor = uint3(float3(icolor) * (diffuse + 0.15));
+      icolor = min(icolor, TRUE_COLOR ? uint3(255u, 255u, 255u) : uint3(31u, 31u, 31u));
+    }
   #endif
 
   #if SHADER_BLENDING

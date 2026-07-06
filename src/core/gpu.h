@@ -110,6 +110,34 @@ TickCount GetSystemTicksUntilTicksAndLine(u32 ticks, u32 line);
 u16 GetCRTCActiveStartLine();
 u16 GetCRTCActiveEndLine();
 
+struct MDECVideoRegion {
+  u16 x = 0;
+  u16 y = 0;
+  u16 width = 0;
+  u16 height = 0;
+  bool active = false;
+};
+
+GPU::MDECVideoRegion GetActiveMDECVideoRegion();
+void SetMDECUpscaleEnabled(bool enabled);
+bool IsMDECUpscaleEnabled();
+void SetGTELightingEnabled(bool enabled);
+bool IsGTELightingEnabled();
+
+struct MDECVideoRegion {
+  u16 x = 0;
+  u16 y = 0;
+  u16 width = 0;
+  u16 height = 0;
+  bool active = false;
+};
+
+GPU::MDECVideoRegion GetActiveMDECVideoRegion();
+void SetMDECUpscaleEnabled(bool enabled);
+bool IsMDECUpscaleEnabled();
+void SetGTELightingEnabled(bool enabled);
+bool IsGTELightingEnabled();
+
 // Returns the video clock frequency.
 TickCount GetCRTCFrequency();
 
